@@ -4,7 +4,7 @@ import re
 import streamlit as st
 import zipfile
 from collections import Counter
-import fitz  # PyMuPDF
+import fitz
 import os
 import altair as alt
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS

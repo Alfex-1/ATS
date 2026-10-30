@@ -1,6 +1,7 @@
-pandas==2.3.2
-sklearn==1.7.2
-streamlit==1.42.2
-nltk==3.9.1
-PyMuPDF
-altair
+pandas==3.1.0
+numpy==2.5.4
+scikit-learn==1.9.1
+streamlit==1.66.1
+nltk==3.10.4
+PyMuPDF==2.0
+altair==6.3.0

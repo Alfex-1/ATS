@@ -1,21 +1,34 @@
-from sklearn.feature_extraction.text import TfidfVectorizer
-import pandas as pd
+# --- Bibliothèque standard ---
+import os
 import re
-import streamlit as st
+import unicodedata
 import zipfile
 from collections import Counter
-import fitz
-import os
-import altair as alt
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+
+# --- Bibliothèques tierces ---
+import altair
 import nltk
-nltk.download('stopwords')
+import pandas as pd
+import pymupdf
+import streamlit as st
 from nltk.corpus import stopwords
-import unicodedata
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
+
+
+# --- Données NLTK ---
+@st.cache_resource
+def ensure_nltk_data() -> None:
+    try:
+        nltk.data.find("corpora/stopwords")
+    except LookupError:
+        nltk.download("stopwords", quiet=True)
+
+
+ensure_nltk_data()
 
 # --- Extraction texte PDF (bytes) ---
 def extract_text_from_pdf_bytes(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     text = ""
     for page in doc:
         text += page.get_text()

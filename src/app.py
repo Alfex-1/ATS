@@ -1,18 +1,21 @@
 # --- Bibliothèque standard ---
+import io
 import os
 import re
 import unicodedata
 import zipfile
 from collections import Counter
+from pathlib import Path
 
 # --- Bibliothèques tierces ---
-import altair
+import altair as alt
+import docx  # python-docx
 import nltk
 import pandas as pd
 import pymupdf
 import streamlit as st
 from nltk.corpus import stopwords
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 
 # --- Données NLTK ---
@@ -26,37 +29,76 @@ def ensure_nltk_data() -> None:
 
 ensure_nltk_data()
 
-# --- Extraction texte PDF (bytes) ---
-def extract_text_from_pdf_bytes(pdf_bytes):
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    return text.lower()
+
+# --- Extraction texte (PDF / Word), mise en cache pour les reruns Streamlit ---
+SUPPORTED_EXT = (".pdf", ".docx")
+
+
+def _extract_pdf(data: bytes) -> str:
+    with pymupdf.open(stream=data, filetype="pdf") as doc:
+        # sort=True : meilleur ordre de lecture (CV sur plusieurs colonnes)
+        return "\n".join(page.get_text(sort=True) for page in doc)
+
+
+def _extract_docx(data: bytes) -> str:
+    d = docx.Document(io.BytesIO(data))
+    parts = [p.text for p in d.paragraphs]
+    # Les CV Word utilisent souvent des tableaux pour la mise en page
+    for table in d.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                parts.append(cell.text)
+    return "\n".join(parts)
+
+
+@st.cache_data(show_spinner=False)
+def extract_text(data: bytes, ext: str) -> str:
+    return _extract_pdf(data) if ext == ".pdf" else _extract_docx(data)
+
+
+# --- Normalisation pour le matching : minuscules, sans accents ---
+# On garde chiffres, "+" et "#" pour ne pas casser "python3", "c++", "c#".
+def normalize(text: str) -> str:
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9+#\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
 
 # --- Parsing mots-clés pondérés ---
-def parse_keywords(text):
+def parse_keywords(text: str) -> dict:
     kw = {}
     for part in text.split(","):
         part = part.strip()
+        if not part:
+            continue
         if ":" in part:
-            k, v = part.split(":")
+            k, v = part.rsplit(":", 1)
             try:
-                kw[k.strip().lower()] = float(v.strip())
-            except:
-                kw[k.strip().lower()] = 1.0
+                weight = float(v.strip().replace(",", "."))
+            except ValueError:
+                weight = 1.0
         else:
-            kw[part.strip().lower()] = 1.0
+            k, weight = part, 1.0
+        k = normalize(k)
+        if k:
+            kw[k] = weight
     return kw
 
-# --- Scoring texte selon mots-clés pondérés ---
-def score_text(text, keywords_weights):
-    words = text.split()
-    word_counts = Counter(words)
-    score = 0.0
-    for kw, weight in keywords_weights.items():
-        score += word_counts.get(kw.lower(), 0) * weight
-    return score
+
+# --- Comptage des occurrences (mots entiers ou expressions) ---
+def count_keywords(norm_text: str, keywords: dict) -> dict:
+    counts = {}
+    for kw in keywords:
+        pattern = r"(?<![a-z0-9+#])" + re.escape(kw) + r"(?![a-z0-9+#])"
+        counts[kw] = len(re.findall(pattern, norm_text))
+    return counts
+
+
+def score_from_counts(counts: dict, keywords: dict) -> float:
+    return sum(counts[kw] * w for kw, w in keywords.items())
+
 
 # --- Nettoyage du nom de fichier en nom propre ---
 def clean_filename(filepath):
@@ -65,51 +107,64 @@ def clean_filename(filepath):
     if name_without_ext.lower().startswith("cv_"):
         name_without_ext = name_without_ext[3:]
     name_parts = name_without_ext.replace("-", " ").replace("_", " ").split()
-    name_parts = [part.capitalize() for part in name_parts]
-    return " ".join(name_parts)
+    return " ".join(part.capitalize() for part in name_parts)
 
-# --- Compte occurrences mots-clés dans un texte ---
-def count_keywords_in_text(text, keywords):
-    words = text.lower().split()
-    counts = Counter()
-    for kw in keywords.keys():
-        counts[kw] = words.count(kw.lower())
-    return counts
 
 def clean_text(text):
-    # Normalisation Unicode : transforme les lettres accentuées en lettre + accent
-    text = unicodedata.normalize('NFD', text)
-    # Supprime les accents
-    text = ''.join([char for char in text if not unicodedata.combining(char)])
-    # Lowercase
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
     text = text.lower()
-    # Supprime la ponctuation et chiffres (ajuste si besoin)
-    text = re.sub(r'[^a-z\s]', ' ', text)
-    # Supprime les espaces multiples
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    text = re.sub(r"[^a-z\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
 
 def extract_keywords(text, top_k=10):
     cleaned_text = clean_text(text)
-    french_stopwords = stopwords.words('french')
-    
+    french_stopwords = stopwords.words("french")
+
     vectorizer = TfidfVectorizer(stop_words=french_stopwords, max_features=100)
     tfidf_matrix = vectorizer.fit_transform([cleaned_text])
     feature_names = vectorizer.get_feature_names_out()
     scores = tfidf_matrix.toarray()[0]
-    
-    tfidf_dict = {term: score for term, score in zip(feature_names, scores)}
-    
-    # Top k par score brut
-    top_terms = sorted(tfidf_dict.items(), key=lambda x: x[1], reverse=True)[:top_k]
 
+    top_terms = sorted(zip(feature_names, scores), key=lambda x: x[1], reverse=True)[:top_k]
     max_score = top_terms[0][1] if top_terms else 1
 
-    df = pd.DataFrame(top_terms, columns=["Mots_clés", "Score de suggestions (en %)"])
-    df["Score de suggestions (en %)"] = (df["Score de suggestions (en %)"] / max_score) * 100
-    df["Score de suggestions (en %)"] = df["Score de suggestions (en %)"].round(2)
-    
+    col = "Score de suggestions (en %)"
+    df = pd.DataFrame(top_terms, columns=["Mots_clés", col])
+    df[col] = ((df[col] / max_score) * 100).round(2)
     return df
+
+
+# --- Chargement des documents : liste de (nom, bytes) ---
+def load_documents(folder: str, zip_file, recurse: bool):
+    docs, ignored = [], []
+    if zip_file is not None:
+        with zipfile.ZipFile(zip_file) as z:
+            for name in z.namelist():
+                base = os.path.basename(name)
+                if not base or base.startswith(("~$", ".")):
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if ext in SUPPORTED_EXT:
+                    docs.append((name, z.read(name)))
+                elif ext == ".doc":
+                    ignored.append(name)
+    elif folder.strip():
+        root = Path(folder.strip().strip('"')).expanduser()
+        if not root.is_dir():
+            return None, ignored
+        files = root.rglob("*") if recurse else root.glob("*")
+        for p in sorted(files):
+            if not p.is_file() or p.name.startswith(("~$", ".")):
+                continue
+            ext = p.suffix.lower()
+            if ext in SUPPORTED_EXT:
+                docs.append((str(p.relative_to(root)), p.read_bytes()))
+            elif ext == ".doc":
+                ignored.append(p.name)
+    return docs, ignored
+
 
 # --- Interface Streamlit ---
 st.title("🧠 Analyse intelligente de CV")
@@ -118,13 +173,29 @@ st.subheader("Votre assistant flexible pour la détection des talents")
 st.write("""
 Optimisez vos recrutements grâce à un outil simple, rapide et efficace :
 
-📁 **1. Téléversez un fichier `.zip` contenant les CV au format PDF**  
-📝 **2. Définissez vos critères de sélection via une liste de mots-clés pondérés**  
-🔍 **3. Obtenez un score pour chaque CV basé sur la pertinence des mots-clés**  
+📁 **1. Téléversez un fichier `.zip` contenant les CV au format PDF**
+
+📝 **2. Définissez vos critères de sélection via une liste de mots-clés pondérés**
+
+🔍 **3. Obtenez un score pour chaque CV basé sur la pertinence des mots-clés**
+
 ✉️ **4. Contactez les candidats les plus prometteurs !**
 """)
 
-uploaded_zip = st.file_uploader("Téléversez le ZIP des CV PDF", type=["zip"])
+source = st.radio("Source des CV", ["📂 Dossier sur mon ordinateur", "🗜️ Fichier ZIP"], horizontal=True)
+
+uploaded_zip = None
+folder_path = ""
+recursive = True
+if source.startswith("📂"):
+    folder_path = st.text_input(
+        "Chemin du dossier contenant les CV (PDF et Word .docx)",
+        placeholder=r"C:\Users\moi\Documents\CV   ou   /Users/moi/Documents/CV",
+    )
+    recursive = st.checkbox("Inclure les sous-dossiers", value=True)
+    st.caption("Fonctionne si l'application tourne sur votre ordinateur (`streamlit run app.py`).")
+else:
+    uploaded_zip = st.file_uploader("Téléversez le ZIP des CV (PDF et Word .docx)", type=["zip"])
 
 job_description = st.text_area("Collez votre offre d'emploi ici (texte brut)", height=250)
 
@@ -140,99 +211,107 @@ if job_description:
     st.markdown("### Mots-clés suggérés")
     st.dataframe(df_keywords, use_container_width=True, hide_index=True)
 
-    # Prépare la chaîne à coller dans la zone mots-clés pondérés
-    suggestion = ", ".join([f"{row.Mots_clés}:1" for _, row in df_keywords.iterrows()])
+    suggestion = ", ".join(f"{kw}:1" for kw in df_keywords["Mots_clés"])
     st.markdown("#### Copiez-collez cette suggestion dans la zone mots-clés pondérés :")
     st.code(suggestion)
 
-if uploaded_zip and keywords_input.strip():
+has_source = uploaded_zip is not None or bool(folder_path.strip())
+
+if has_source and keywords_input.strip():
     keywords_weights = parse_keywords(keywords_input)
+    score_max = sum(keywords_weights.values())
+    documents, ignored = load_documents(folder_path, uploaded_zip, recursive)
 
-    with zipfile.ZipFile(uploaded_zip) as z:
-        pdf_files = [f for f in z.namelist() if f.lower().endswith(".pdf")]
+    if documents is None:
+        st.error("Dossier introuvable. Vérifiez le chemin.")
+    elif not keywords_weights:
+        st.warning("Aucun mot-clé valide détecté.")
+    elif score_max <= 0:
+        st.warning("La somme des poids doit être strictement positive.")
+    elif not documents:
+        st.error("Aucun fichier PDF ou Word (.docx) trouvé.")
+    else:
+        if ignored:
+            st.info(f"{len(ignored)} fichier(s) .doc ignoré(s) (ancien format Word) : enregistrez-les en .docx.")
 
-        if not pdf_files:
-            st.error("Aucun fichier PDF trouvé dans le ZIP.")
+        rows = []         # un dict par CV
+        occurrences = []  # format long : candidat / mot-clé / occurrences
+        seen = Counter()
+
+        for name, data in documents:
+            candidate = clean_filename(name)
+            seen[candidate] += 1
+            if seen[candidate] > 1:  # même nom dans deux sous-dossiers
+                candidate = f"{candidate} ({seen[candidate]})"
+            try:
+                text = extract_text(data, os.path.splitext(name)[1].lower())
+            except Exception:
+                st.warning(f"Impossible de lire « {name} » (fichier ignoré).")
+                continue
+
+            if not text.strip():
+                st.warning(f"« {name} » ne contient pas de texte (PDF scanné ? OCR nécessaire).")
+
+            counts = count_keywords(normalize(text), keywords_weights)
+            score = score_from_counts(counts, keywords_weights)
+            match_pct = min(100.0, round(score / score_max * 100, 1))
+
+            rows.append({"Candidat": candidate, "Score brut": score, "Correspondance (%)": match_pct})
+            for kw, occ in counts.items():
+                occurrences.append({"Candidat": candidate, "Mot-clé": kw, "Occurrences": occ})
+
+        if not rows:
+            st.error("Aucun CV exploitable.")
         else:
-            results = []
-            texts = {}
-
-            for pdf_name in pdf_files:
-                with z.open(pdf_name) as pdf_file:
-                    pdf_bytes = pdf_file.read()
-                    text = extract_text_from_pdf_bytes(pdf_bytes)
-                    texts[pdf_name] = text
-
-                    score = score_text(text, keywords_weights)
-                    score_max = sum(keywords_weights.values())
-                    match_pct = min(100.0, round((score / score_max) * 100, 1))
-
-                    results.append((clean_filename(pdf_name), score, match_pct))
-
-            # Tri décroissant sur le score
-            results.sort(key=lambda x: x[1], reverse=True)
-
-            # Résultats globaux
+            df_results = (
+                pd.DataFrame(rows)
+                .sort_values("Score brut", ascending=False)
+                .reset_index(drop=True)
+            )
             st.write("### Résultats du scoring")
-            df_results = pd.DataFrame(results, columns=["Candidat", "Score brut", "Correspondance (%)"])
             st.dataframe(df_results, use_container_width=True, hide_index=True)
 
-            # Top X
-            df_top = df_results.nlargest(top, "Correspondance (%)")
+            df_top = df_results.head(top)
+            df_occ = pd.DataFrame(occurrences)
+            df_occ_top = df_occ[df_occ["Candidat"].isin(df_top["Candidat"])]
 
-            # --- Graphique : Correspondance en % des top candidats ---
+            # --- Correspondance (%) des top candidats ---
             bar_scores = alt.Chart(df_top).mark_bar().encode(
-                x=alt.X('Candidat', sort='-y'),
-                y=alt.Y('Correspondance (%):Q', title='Score de correspondance (%)'),
-                tooltip=['Candidat', 'Correspondance (%)']
+                x=alt.X("Candidat:N", sort="-y"),
+                y=alt.Y("Correspondance (%):Q", title="Score de correspondance (%)"),
+                tooltip=["Candidat", "Correspondance (%)"],
             ).properties(title=f"Scores de correspondance des Top {top} candidats")
             st.altair_chart(bar_scores, use_container_width=True)
 
-            # --- Occurrences totales des mots-clés dans les Top candidats ---
-            total_counts = Counter()
-            for candidate in df_top['Candidat']:
-                for filename, text in texts.items():
-                    if clean_filename(filename) == candidate:
-                        total_counts += count_keywords_in_text(text, keywords_weights)
-
-            df_counts = pd.DataFrame(total_counts.items(), columns=['Mot-clé', 'Occurrences']).sort_values(by='Occurrences', ascending=False)
-
+            # --- Occurrences totales des mots-clés dans le top ---
+            df_counts = (
+                df_occ_top.groupby("Mot-clé", as_index=False)["Occurrences"].sum()
+                .sort_values("Occurrences", ascending=False)
+            )
             bar_counts = alt.Chart(df_counts).mark_bar().encode(
-                x=alt.X('Mot-clé', sort='-y'),
-                y='Occurrences',
-                tooltip=['Mot-clé', 'Occurrences']
+                x=alt.X("Mot-clé:N", sort="-y"),
+                y="Occurrences:Q",
+                tooltip=["Mot-clé", "Occurrences"],
             ).properties(title=f"Occurrences des mots-clés dans les Top {top} CV")
             st.altair_chart(bar_counts, use_container_width=True)
 
-            # --- Diagramme groupé : Occurrences des mots-clés par candidat ---
-            data_occurrences = []
-            for candidate in df_top['Candidat']:
-                for filename, text in texts.items():
-                    if clean_filename(filename) == candidate:
-                        counts = count_keywords_in_text(text, keywords_weights)
-                        for kw, occ in counts.items():
-                            data_occurrences.append({"Candidat": candidate, "Mot-clé": kw, "Occurrences": occ})
-
-            df_occurrences = pd.DataFrame(data_occurrences)
-
-            grouped_chart = alt.Chart(df_occurrences).mark_bar().encode(
-                x=alt.X('Candidat:N', title=None, axis=alt.Axis(labelAngle=-45)),
-                y=alt.Y('Occurrences:Q', title='Nombre d\'occurrences'),
-                color=alt.Color('Mot-clé:N'),
-                column=alt.Column('Mot-clé:N', header=alt.Header(labelOrient='bottom', labelAngle=0, labelFontSize=18))
+            # --- Diagramme groupé : occurrences par candidat ---
+            grouped_chart = alt.Chart(df_occ_top).mark_bar().encode(
+                x=alt.X("Candidat:N", title=None, axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y("Occurrences:Q", title="Nombre d'occurrences"),
+                color=alt.Color("Mot-clé:N"),
+                column=alt.Column("Mot-clé:N", header=alt.Header(labelOrient="bottom", labelAngle=0, labelFontSize=18)),
             ).properties(
                 width=100,
                 height=250,
-                title=f"Occurrences des mots-clés par candidat dans le Top {top}"
+                title=f"Occurrences des mots-clés par candidat dans le Top {top}",
             ).configure_axis(
                 labelFontSize=12,
-                titleFontSize=14
+                titleFontSize=14,
             ).configure_title(
                 fontSize=16,
-                anchor='start'
+                anchor="start",
             )
-
-            st.altair_chart(grouped_chart, use_container_width=True)
-else:
-    if uploaded_zip and not keywords_input.strip():
-        st.warning("Merci d'entrer les mots-clés avec leurs poids.")
+            st.altair_chart(grouped_chart, use_container_width=False)
+elif has_source and not keywords_input.strip():
+    st.warning("Merci d'entrer les mots-clés avec leurs poids.")
